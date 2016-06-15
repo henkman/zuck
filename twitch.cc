@@ -1,9 +1,10 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
-#include <curl/curl.h>
-#include "json.c"
+// include <stdlib.h>
+// include <stdio.h>
+// include <string.h>
+// include <time.h>
+// include <curl/curl.h>
+// define JSMN_PARENT_LINKS
+// include "jsmn.c"
 
 #define STRING(x) ((String){data:(char *)x, size:sizeof(x)-1})
 
@@ -18,10 +19,7 @@ typedef struct {
 } Chunk;
 
 typedef struct {
-	String url;
-	struct {
-		unsigned x, y;
-	} Resolution;
+	String url; // NUL-terminated
 } Stream;
 
 typedef enum {
@@ -93,80 +91,83 @@ http_get(const char *url, Chunk *out)
 	return ok;
 }
 
-static int
-find_json_object_child(String *out, json_value *root, String key)
-{
-	for (unsigned i=0; i<root->u.object.length; i++) {
-		json_object_entry *oe = &root->u.object.values[i];
-		if (key.size == oe->name_length &&
-			memcmp(key.data, oe->name, key.size) == 0 &&
-			oe->value->type == json_string) {
-			json_value *v = oe->value;
-			out->data = v->u.string.ptr;
-			out->size = v->u.string.length;
-			return 1;
-		}
-	}
-	return 0;
-}
-
 static unsigned
 rand_limit(unsigned limit) {
-    double divisor = ((double)RAND_MAX)/((double)limit);
-    unsigned r;
-    do { 
-        r = rand()/divisor;
-    } while (r == limit);
-    return r;
+	double divisor = ((double)RAND_MAX)/((double)limit);
+	unsigned r;
+	do { 
+		r = rand()/divisor;
+	} while (r == limit);
+	return r;
 }
 
 static int
-get_token_and_signature(String *sig, String *token, String channel)
+jsoneq(Chunk *json, jsmntok_t *tok, String s)
 {
-	int ok = 1;
+	return tok->type == JSMN_STRING &&
+		(int) s.size == tok->end - tok->start &&
+		memcmp(
+			json->data + tok->start,
+			s.data,
+			tok->end - tok->start
+		) == 0;
+}
+
+static void
+string_unescape(String *t, String *s)
+{
+	unsigned o = 0;
+	for (unsigned i=0; i<s->size; i++) {
+		if (s->data[i] == '\\') {
+			if (i < s->size) {
+				t->data[o++] = s->data[i+1];
+				i++;
+				continue;
+			}
+		}
+		t->data[o++] = s->data[i]; 
+	}
+	t->size = o;
+}
+
+static int
+get_token_and_signature(String *sig, String *token, String channel, Chunk *chunk)
+{
 	sig->data = token->data = NULL;
-	Chunk chunk = {
-		.cap = 512,
-		.size = 0
-	};
-	chunk.data = (char *)malloc(sizeof(char)*chunk.cap);
 	char url[256];
-	snprintf(
+	int n = snprintf(
 		url, sizeof(url),
 		"http://api.twitch.tv/api/channels/%.*s/access_token",
 		channel.size, channel.data
 	);
-	if (!http_get(url, &chunk)) {
-		ok = 0;
-		goto clean_chunk;	
+	if (n < 0 || n >= sizeof(url) || !http_get(url, chunk)) {
+		return 0;
 	}
 	{
-		String s, t;
-		json_value *root = json_parse(chunk.data, chunk.size);
-		if (!root || root->type != json_object) {
-			ok = 0;
-			goto clean_json;
+		jsmn_parser p;
+		jsmntok_t t[16];
+		jsmn_init(&p);
+		int r = jsmn_parse(&p, chunk->data, chunk->size, t,
+			sizeof(t)/sizeof(t[0]));
+		if (r < 1 || t[0].type != JSMN_OBJECT) {
+			return 0;
 		}
-		if (!find_json_object_child(&s, root, STRING("sig"))) {
-			ok = 0;
-			goto clean_json;
+		for (unsigned i = 1; i < r; i++) {
+			if (jsoneq(chunk, &t[i], STRING("sig"))) {
+				sig->size = t[i+1].end - t[i+1].start;
+				sig->data = chunk->data + t[i+1].start;
+				i++;
+			} else if (jsoneq(chunk, &t[i], STRING("token"))) {
+				token->size = t[i+1].end-t[i+1].start;
+				token->data = chunk->data + t[i+1].start;
+				i++;
+			}
 		}
-		if (!find_json_object_child(&t, root, STRING("token"))) {
-			ok = 0;
-			goto clean_json;
+		if (!sig->data || !token->data) {
+			return 0;
 		}
-		sig->size = s.size;
-		sig->data = malloc(sizeof(char)*s.size);
-		memcpy(sig->data, s.data, s.size);
-		token->size = t.size;
-		token->data = malloc(sizeof(char)*t.size);
-		memcpy(token->data, t.data, t.size);
-	clean_json:
-		json_value_free(root);
 	}
-clean_chunk:
-	free(chunk.data);
-	return ok;
+	return 1;
 }
 
 static int
@@ -253,8 +254,7 @@ find_stream_url(Stream *s, String m3u8, Quality q)
 			}
 			skip_line();
 		}
-		{
-			// TODO: resolution
+		{ // EXT-X-STREAM-INF
 			skip_line();
 		}
 		{
@@ -277,8 +277,9 @@ find_stream_url(Stream *s, String m3u8, Quality q)
 			}
 			unsigned size = o-b;
 			s->url.size = size;
-			s->url.data = malloc(sizeof(char)*(size));
+			s->url.data = (char*)malloc(sizeof(char)*(size+1));
 			memcpy(s->url.data, &m3u8.data[b], size);
+			s->url.data[s->url.size] = 0;
 			return 1;
 		}
 	}
@@ -289,60 +290,43 @@ end:
 static int
 get_live_stream(Stream *stream, String channel, Quality q)
 {
+	Chunk chunk;
+	chunk.cap = 512;
+	chunk.size = 0;
+	chunk.data = (char *)malloc(sizeof(char)*chunk.cap);
 	String sig, token;
-	if (!get_token_and_signature(&sig, &token, channel)) {
-		if (sig.data) {
-			free(sig.data);
-		}
-		if (token.data) {
-			free(token.data);
-		}
+	if (!get_token_and_signature(&sig, &token, channel, &chunk)) {
+		free(chunk.data);
 		return 0;
 	}
 	int ok = 0;
-	Chunk chunk = {
-		.cap = 512,
-		.size = 0
-	};
-	chunk.data = (char *)malloc(sizeof(char)*chunk.cap);
 	{
-		char url[512];
-		snprintf(
+		char utoken[token.size];
+		String putoken = (String){.data=utoken, .size=sizeof(utoken)};
+		string_unescape(&putoken, &token);
+		char url[1024];
+		int n = snprintf(
 			url, sizeof(url),
 			"http://usher.twitch.tv/api/channel/hls/%.*s.m3u8"
 			"?player=twitchweb&token=%.*s&sig=%.*s"
 			"&allow_audio_only=true&allow_source=true&type=any&p=%u",
 			channel.size, channel.data,
-			token.size, token.data,
+			putoken.size, putoken.data,
 			sig.size, sig.data,
 			rand_limit(10000000)
 		);
-		free(sig.data);
-		free(token.data);
-		if (!http_get(url, &chunk)) {
+		chunk.size = 0;
+		if (n < 0 || n >= sizeof(url) || !http_get(url, &chunk)) {
 			goto end;	
 		}
 	}
-	String m3u8 = (String){.data=chunk.data, .size=chunk.size};
-	if (find_stream_url(stream, m3u8, q)) {
-		ok = 1;
+	{
+		String m3u8 = (String){.data=chunk.data, .size=chunk.size};
+		if (find_stream_url(stream, m3u8, q)) {
+			ok = 1;
+		}
 	}
 end:
 	free(chunk.data);
 	return ok;
 }
-
-int main(int argc, char **argv)
-{
-	srand(time(NULL));
-	curl_global_init(CURL_GLOBAL_DEFAULT);
-	Stream stream = {0};
-	if (get_live_stream(&stream, STRING("food"), Quality_Medium)) {
-		printf("%.*s\n", stream.url.size, stream.url.data);
-		free(stream.url.data);
-	}
-	curl_global_cleanup();
-	
-	return 0;
-}
-

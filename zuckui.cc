@@ -1,5 +1,12 @@
-// g++ -o zuckui zuckui.cc -lfltk -lmpv -DUSE_MPV
-// g++ -o zuckui zuckui.cc -lfltk -L"C:\Program Files (x86)\VideoLAN\VLC" -lvlc -DUSE_VLC=1
+// g++ -std=c++98 -O2 -s -static-libgcc -static-libstdc++ -o zuckui zuckui.cc -Wl,-Bstatic -lfltk -Wl,-Bdynamic -lcurl -lmpv -DUSE_MPV -lgdi32 -lcomctl32 -lole32 -luuid
+// g++ -std=c++98 -O2 -s -static-libgcc -static-libstdc++ -o zuckui zuckui.cc -Wl,-Bstatic -lfltk -Wl,-Bdynamic -lcurl -L"C:\Program Files (x86)\VideoLAN\VLC" -lvlc -DUSE_VLC=1 -lgdi32 -lcomctl32 -lole32 -luuid
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include <curl/curl.h>
 
 #include <FL/Fl.H>
 #include <FL/Fl_Window.H>
@@ -18,6 +25,11 @@
 #else
 	#error "no video player set"
 #endif
+
+#define JSMN_STRICT
+#define JSMN_PARENT_LINKS
+#include "jsmn.cc"
+#include "twitch.cc"
 
 struct ZuckChat : public Fl_Group {
 	const static int defaultWidth = 250;
@@ -169,6 +181,8 @@ struct ZuckWindow : public Fl_Window {
 		vidy+VideoControls::defaultHeight,
 		"Zuck"
 	) {
+		srand(time(NULL));
+		curl_global_init(CURL_GLOBAL_DEFAULT);
 		HorizontalSplitTile *maintile = new HorizontalSplitTile(
 			ZuckChat::defaultWidth, 0, 0, w(), h()
 		);
@@ -192,6 +206,20 @@ struct ZuckWindow : public Fl_Window {
 		maintile->end();
 		end();
 	}
+	~ZuckWindow() {
+		curl_global_cleanup();
+	}
+	void loadStream(String name, Quality q) {
+		Stream stream = {0};
+		if (get_live_stream(&stream, name, q)) {
+			#ifdef USE_MPV
+			video->loadFile(stream.url.data);
+			#elif USE_VLC
+			video->loadUrl(stream.url.data);
+			#endif
+			free(stream.url.data);
+		}
+	}
 	void show() {
 		Fl_Window::show();
 		this->video->initializeHandle();
@@ -202,13 +230,10 @@ struct ZuckWindow : public Fl_Window {
 };
 
 int main(int argc, char **argv) {
-	if(argc < 2) {
-		return 1;
-	}
 	ZuckWindow win;
 	win.resizable(win);
 	win.show();
 	// win.fullscreen();
-	win.video->loadFile(argv[1]);
+	win.loadStream(STRING("food"), Quality_Medium);
 	return Fl::run();
 }
